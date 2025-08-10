@@ -27,6 +27,7 @@ local function add_inline_highlights(line, old_lines, new_lines, undo_deletions,
   local line_a = splice(old_lines[line])
   local line_b = splice(new_lines[line])
   local line_diff = vim.diff(line_a, line_b, { result_type = "indices" })
+
   logger.trace(function()
     return ("Changed lines (line %d):\nOriginal: '%s' (len=%d)\nUpdated:  '%s' (len=%d)\n\nInline hunks: %s"):format(
       line,
@@ -38,43 +39,54 @@ local function add_inline_highlights(line, old_lines, new_lines, undo_deletions,
     )
   end)
 
-  local defer
   local col_offset = 0
+
   for _, line_hunk in ipairs(line_diff) do
     local start_a, count_a, start_b, count_b = unpack(line_hunk)
     local hunk_kind = (count_a == 0 and "insertion") or (count_b == 0 and "deletion") or "change"
 
-    if hunk_kind ~= "deletion" or undo_deletions then
-      local highlight = {
-        hunk = line_hunk,
-        kind = hunk_kind,
-        line = line,
-        -- Add 1 because when count is zero, start_b / start_b is the position before the deletion
-        column = (hunk_kind == "deletion") and start_b + 1 or start_b,
-        length = (hunk_kind == "deletion") and count_a or count_b,
-      }
+    local function push_hl(kind, ln, col, len)
+      table.insert(highlights, { kind = kind, line = ln, column = col, length = len })
+    end
 
-      if highlight.kind == "deletion" and undo_deletions then
+    if hunk_kind == "insertion" then
+      -- insertion: highlight the new text at start_b (no +1)
+      push_hl("insertion", line, start_b + col_offset, count_b)
+    elseif hunk_kind == "deletion" then
+      if undo_deletions then
+        -- deletion-only: start_b is position *before* deletion, so add +1
+        local insert_pos = col_offset + start_b + 1
         local deleted_part = old_lines[line]:sub(start_a, start_a + count_a - 1)
-        -- Restore deleted characters
-        new_lines[line] = string_insert(new_lines[line], deleted_part, col_offset + start_b + 1)
-        defer = function()
-          col_offset = col_offset + #deleted_part
-        end
+        new_lines[line] = string_insert(new_lines[line], deleted_part, insert_pos)
+        push_hl("deletion", line, insert_pos, count_a)
+        col_offset = col_offset + #deleted_part
       end
-      -- Observation: when changing "line" to "tes", there should not be an offset (-2)
-      -- after changing "lin" to "t" (because we are not modifying the line)
-      highlight.column = highlight.column + col_offset
-      highlight.hunk = nil
-      table.insert(highlights, highlight)
+    else -- "change"
+      if undo_deletions then
+        -- change: treat as deletion then insertion.
+        -- start_b points at the new text's first char, so DO NOT add +1 here.
+        local insert_pos = col_offset + start_b
+        local deleted_part = old_lines[line]:sub(start_a, start_a + count_a - 1)
 
-      if defer then
-        defer()
-        defer = nil
+        -- Insert deleted text before the new text
+        new_lines[line] = string_insert(new_lines[line], deleted_part, insert_pos)
+
+        -- Deleted (old) chunk: highlight at insert_pos
+        push_hl("deletion", line, insert_pos, count_a)
+
+        -- Inserted (new) chunk: right after the deleted chunk
+        push_hl("insertion", line, insert_pos + count_a, count_b)
+
+        -- update offset for later hunks
+        col_offset = col_offset + #deleted_part
+      else
+        -- fallback: only show the new text (original behaviour)
+        push_hl("change", line, start_b + col_offset, count_b)
       end
     end
   end
 end
+
 
 --- @param old_lines string[]
 --- @param new_lines string[]
